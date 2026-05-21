@@ -1,0 +1,12 @@
+numpy
+opencv-python
+Pillow
+open3d
+transformers
+torch
+torchvision
+gradio
+ffmpeg-python
+scipy
+matplotlib
+tqdm

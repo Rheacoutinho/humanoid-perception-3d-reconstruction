@@ -1,0 +1,9 @@
+checkpoints/
+frames/
+output/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.egg-info/
+dist/
+build/
