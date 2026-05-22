@@ -133,7 +133,7 @@ def run_mast3r_reconstruction(
     # next `win_size` frames. This is more efficient than all-pairs and
     # works well for video (frames are temporally ordered).
     # ------------------------------------------------------------------ #
-    win_size = 5  # each frame paired with 5 neighbours
+    win_size = 3  # reduced to 3 frames 
     print(f"\nBuilding image pairs (window size = {win_size})...")
     pairs = make_pairs(
         images,
