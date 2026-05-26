@@ -6,7 +6,9 @@ transformers
 torch
 torchvision
 gradio
-ffmpeg-python
 scipy
 matplotlib
 tqdm
+anthropic
+fastsam
+plotly
