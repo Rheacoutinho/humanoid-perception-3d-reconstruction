@@ -1,9 +1,30 @@
+# Model checkpoints
 checkpoints/
+*.pth
+*.pt
+*.bin
+
+# Data outputs
 frames/
 output/
+video/
+
+# Python
 __pycache__/
 *.pyc
-.ipynb_checkpoints/
 *.egg-info/
 dist/
 build/
+.ipynb_checkpoints/
+
+# Environment
+.env
+*.env
+venv/
+.venv/
+
+# Colab
+*.ipynb
+
+# OS
+.DS_Store
