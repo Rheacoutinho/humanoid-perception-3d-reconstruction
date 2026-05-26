@@ -97,11 +97,11 @@ class PoseEstimator:
 
     def backproject_point(
         self,
-        u: float,
-        v: float,
-        depth_map: np.ndarray,
-        pose_cam_to_world: np.ndarray,
-        scale: float,
+        u,
+        v,
+        depth_map,
+        pose_cam_to_world,
+        scale,
     ):
         """
         Back-project a 2D pixel (u, v) to a 3D world point

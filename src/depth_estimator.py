@@ -94,6 +94,13 @@ class DepthEstimator:
         if depth.shape != (h, w):
             depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
 
+	# ── Normalise to 0–1 range 
+        # HuggingFace DA2 pipeline returns 0–255 float32
+        # Normalise here so all downstream code always gets 0–1
+        d_max = depth.max()
+        if d_max > 1.0:
+            depth = depth / d_max
+
         return depth
 
     def estimate_batch(
@@ -165,34 +172,32 @@ class DepthEstimator:
 
 def compute_global_scale(depth_stats: dict, near_anchor_m: float = 0.5) -> float:
     """
-    Compute a single global scale factor that converts relative depth
-    values to approximate metric (metres).
+    Compute a single global scale factor converting relative depth to metres.
+
+    IMPORTANT: Depth-Anything V2 via HuggingFace pipeline returns values
+    in 0–255 range (uint8 mapped to float32). We normalise to 0–1 first
+    before computing the scale factor.
 
     Strategy:
-    - Take the 5th percentile depth value across all frames
-      (the "near" anchor — closest reliably-visible surface)
-    - Assume this corresponds to near_anchor_m in the real world
+    - Normalise each depth map to 0–1
+    - Take the 5th percentile (closest reliable surface)
+    - Assume that corresponds to near_anchor_m in the real world
     - scale = near_anchor_m / median(5th_percentile_values)
-
-    This gives a scale that makes sense across the whole video
-    rather than per-frame, avoiding drift.
-
-    Parameters
-    ----------
-    depth_stats   : output of estimate_batch()
-    near_anchor_m : assumed real-world distance of the nearest surface (metres)
-                    0.5m is conservative — assumes camera is 50cm from walls
-
-    Returns
-    -------
-    scale : float — multiply relative depth by this to get metres
+    - Final usage: depth_metres = (raw_depth / 255.0) * scale
     """
     near_values = []
 
     for fname, s in depth_stats.items():
         depth_path = s["path"]
-        depth      = np.load(depth_path)
-        valid      = depth[depth > 0]
+        depth      = np.load(depth_path).astype(np.float32)
+
+        # Normalise to 0–1 regardless of original range
+        d_max = depth.max()
+        if d_max > 1.0:
+            depth = depth / d_max   # normalise by actual max, not fixed 255
+                                     # handles both 0-255 and 0-1 outputs
+
+        valid = depth[depth > 0.01]
         if len(valid) > 100:
             near_values.append(float(np.percentile(valid, 5)))
 
@@ -203,16 +208,34 @@ def compute_global_scale(depth_stats: dict, near_anchor_m: float = 0.5) -> float
     median_near = float(np.median(near_values))
 
     if median_near < 1e-6:
-        print("WARNING: near depth is near zero — using default scale 1.0")
+        print("WARNING: near depth near zero — using default scale 1.0")
         return 1.0
 
     scale = near_anchor_m / median_near
 
     print(f"Global depth scale:")
-    print(f"  Median near depth (5th pct) : {median_near:.4f}")
-    print(f"  Assumed near distance       : {near_anchor_m}m")
-    print(f"  Scale factor                : {scale:.4f}")
-    print(f"  Far depth estimate          : "
-          f"~{max(s['max'] for s in depth_stats.values()) * scale:.2f}m")
+    print(f"  Median near depth (normalised, 5th pct) : {median_near:.4f}")
+    print(f"  Assumed near distance                   : {near_anchor_m}m")
+    print(f"  Scale factor                            : {scale:.4f}")
+    print(f"  Expected max depth                      : "
+          f"~{1.0 * scale:.2f}m")
 
     return scale
+
+
+	
+def renormalise_existing_depths(depths_dir: str) -> None:
+    """
+    One-time fix: renormalise existing depth .npy files from 0–255 to 0–1.
+    Safe to run multiple times — skips files already in 0–1 range.
+    """
+    import glob
+    files = sorted(glob.glob(os.path.join(depths_dir, "depth_*.npy")))
+    fixed = 0
+    for fpath in files:
+        d = np.load(fpath).astype(np.float32)
+        if d.max() > 1.0:
+            d = d / d.max()
+            np.save(fpath, d)
+            fixed += 1
+    print(f"✓ Renormalised {fixed}/{len(files)} depth files in {depths_dir}")
