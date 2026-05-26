@@ -1,14 +1,28 @@
-numpy
-opencv-python
-Pillow
-open3d
-transformers
+# Core vision and ML
 torch
 torchvision
-gradio
+transformers>=4.45.0
+opencv-python
+Pillow
+numpy
 scipy
-matplotlib
 tqdm
-anthropic
-fastsam
+
+# 3D processing
+open3d
+
+# Language-vision
+git+https://github.com/openai/CLIP.git
+
+# Segmentation
+ultralytics
+
+# VLM API (Groq — free, open source models only)
+groq
+
+# Gradio app
+gradio>=4.0.0
 plotly
+
+# Utilities
+matplotlib
