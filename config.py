@@ -16,7 +16,7 @@ GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
 HF_API_TOKEN    = os.environ.get("HF_API_TOKEN", "")
 
 # Groq vision model — free tier, open source
-GROQ_VLM_MODEL  = "meta-llama/llama-4-scout-17b-16e-instruct"
+GROQ_VLM_MODEL  = "llama-3.2-11b-vision-preview"
 
 # HuggingFace fallback model
 HF_VLM_MODEL    = "meta-llama/Llama-3.2-11B-Vision-Instruct"
