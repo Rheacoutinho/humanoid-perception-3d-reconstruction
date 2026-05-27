@@ -12,11 +12,11 @@ import os
 # Get free Groq key at: https://console.groq.com (no credit card)
 # Get free HF token at: https://huggingface.co/settings/tokens
 VLM_PROVIDER    = "groq"
-#(Removed as model not found) GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
+GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
 HF_API_TOKEN    = os.environ.get("HF_API_TOKEN", "")
 
 # Groq vision model — free tier, open source
-# (Groq model not found)  GROQ_VLM_MODEL  = "llama-3.2-11b-vision-preview"
+GROQ_VLM_MODEL  = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 # HuggingFace fallback model
 HF_VLM_MODEL    = "meta-llama/Llama-3.2-11B-Vision-Instruct"
