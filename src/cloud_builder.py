@@ -1,11 +1,11 @@
 """
-cloud_builder.py (ICP Rigorous Alignment Version)
+cloud_builder.py (Fast Coarse-to-Fine Alignment)
 ------------------------------------------------
 Fuses per-frame depth maps + camera poses into a single 3D point cloud,
 then embeds CLIP features into every point.
 
-Optimised for recognizable object reconstruction by utilizing frame-to-model
-ICP alignment loops to automatically correct monocular camera pose errors.
+Optimised for crisp, recognisable object surfaces and fast execution 
+using decoupled coarse-to-fine keyframe ICP.
 """
 
 import numpy as np
@@ -25,7 +25,7 @@ from config import (
     OUTLIER_STD_RATIO,
 )
 
-# Safe cross-version wrapper for Open3D registration APIs
+# Safe cross-version check for Open3D registration APIs
 try:
     import open3d.pipelines.registration as o3d_reg
     _ICP_ALIGN = o3d_reg.registration_icp
@@ -122,66 +122,77 @@ class CloudBuilder:
         batch_size: int = 10,
     ) -> o3d.geometry.PointCloud:
         """
-        Fuse all frames using an incremental frame-to-model ICP registration loop.
-        Corrects pose trajectories in real-time to render crisp, solid 3D structures.
+        Assembles a recognizable, dense 3D scene using an accelerated coarse-to-fine 
+        ICP loop across keyframes, mitigating tracking drift in seconds.
         """
         os.makedirs(output_dir, exist_ok=True)
-        print(f"Building highly-aligned dense point cloud across {len(frame_paths)} frames...")
+        
+        # Step = 3 samples ~26 frames evenly across your 78 total frames
+        frame_step = 3 
+        keyframe_indices = list(range(0, len(frame_paths), frame_step))
+        
+        print(f"Building crisp dense reconstruction using {len(keyframe_indices)} aligned keyframes...")
 
-        # Base anchor point cloud initialized from frame 0
+        # Initialize the global cloud container with the first frame
         pcd_global = o3d.geometry.PointCloud()
         pts_init, cols_init, _ = self.backproject_frame(0, frame_paths[0], depths_dir)
         pcd_global.points = o3d.utility.Vector3dVector(pts_init.astype(np.float64))
         pcd_global.colors = o3d.utility.Vector3dVector(cols_init.astype(np.float64) / 255.0)
         pcd_global = pcd_global.voxel_down_sample(VOXEL_SIZE)
 
-        # ICP Search window configuration based on voxel resolution
-        icp_distance_threshold = VOXEL_SIZE * 4.0
+        # Multi-stage thresholds based on structural dimensions
+        coarse_threshold = VOXEL_SIZE * 6.0
+        fine_threshold   = VOXEL_SIZE * 2.0
 
-        for idx in range(1, len(frame_paths)):
-            # Backproject the upcoming frame with current camera parameters
+        for i, idx in enumerate(keyframe_indices[1:], start=1):
             pts, cols, _ = self.backproject_frame(idx, frame_paths[idx], depths_dir)
             
             pcd_source = o3d.geometry.PointCloud()
             pcd_source.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
             pcd_source.colors = o3d.utility.Vector3dVector(cols.astype(np.float64) / 255.0)
             
-            # Create light copy for fast registration calculation
-            pcd_source_down = pcd_source.voxel_down_sample(VOXEL_SIZE)
+            # CRITICAL SPEED FIX: Downsample aggressively purely for tracking evaluation
+            pcd_target_down = pcd_global.voxel_down_sample(VOXEL_SIZE * 4.0)
+            pcd_source_down = pcd_source.voxel_down_sample(VOXEL_SIZE * 4.0)
 
-            # Evaluate alignment transformation matrix
-            reg_result = _ICP_ALIGN(
-                pcd_source_down, pcd_global, icp_distance_threshold, np.identity(4),
-                _ICP_ESTIMATE(),
-                _ICP_CRITERIA(max_iteration=40)
+            # Pass 1: Coarse Alignment (Pulls drifting objects together)
+            reg_coarse = _ICP_ALIGN(
+                pcd_source_down, pcd_target_down, coarse_threshold, np.identity(4),
+                _ICP_ESTIMATE(), _ICP_CRITERIA(max_iteration=20)
             )
             
-            T_icp = reg_result.transformation
+            # Pass 2: Fine Alignment (Locks object faces and boundaries)
+            reg_fine = _ICP_ALIGN(
+                pcd_source_down, pcd_target_down, fine_threshold, reg_coarse.transformation,
+                _ICP_ESTIMATE(), _ICP_CRITERIA(max_iteration=25)
+            )
             
-            # Guardrail check: Protect trajectory from slipping in sparse regions
-            if reg_result.fitness > 0.15:
-                # 1. Update global camera orientation to sync CLIP mapping down the line
+            T_matrix = reg_fine.transformation
+            
+            # Apply verified adjustments across the system pipeline
+            if reg_fine.fitness > 0.10:
+                # Update trajectory tracking matrices in-place for downstream CLIP operations
                 current_pose = np.array(self.poses[idx]["cam_to_world"], dtype=np.float64)
-                self.poses[idx]["cam_to_world"] = T_icp @ current_pose
+                self.poses[idx]["cam_to_world"] = T_matrix @ current_pose
                 
-                # 2. Adjust frame point placements to fit the target structural profile
-                pcd_source.transform(T_icp)
+                # Transform full-resolution source data
+                pcd_source.transform(T_matrix)
 
-            # Append aligned structural content to reference cloud
+            # Append aligned full-density points into global context
             pcd_global += pcd_source
             pcd_global = pcd_global.voxel_down_sample(VOXEL_SIZE)
 
-            if (idx + 1) % 15 == 0 or idx == len(frame_paths) - 1:
-                print(f"  Processed frame {idx+1}/{len(frame_paths)} "
-                      f"→ Global cloud size: {len(pcd_global.points):,} points")
+            if i % 5 == 0 or idx == keyframe_indices[-1]:
+                print(f"  Aligned Keyframe {i+1}/{len(keyframe_indices)} (Frame {idx}) "
+                      f"→ Cloud Density: {len(pcd_global.points):,} pts")
 
-        # Perform clean statistical edge filtering across final dense surfaces
-        print("\nPolishing scene structures...")
+        # Refine surface noise
+        print("\nSharpening final structural features...")
         pcd_global, _ = pcd_global.remove_statistical_outlier(
-            nb_neighbors=OUTLIER_NEIGHBORS,
-            std_ratio=OUTLIER_STD_RATIO
+            nb_neighbors=int(OUTLIER_NEIGHBORS * 1.2),
+            std_ratio=OUTLIER_STD_RATIO * 0.8
         )
-        print(f"  Final optimized structural point count: {len(pcd_global.points):,}")
+        print(f"✓ Crisp reconstruction complete: {len(pcd_global.points):,} total points.")
 
         ply_path = os.path.join(output_dir, "pointcloud_rgb.ply")
         o3d.io.write_point_cloud(ply_path, pcd_global)
@@ -198,7 +209,7 @@ class CloudBuilder:
         keyframe_step: int = 5,
     ) -> dict:
         """
-        [Unchanged signature and logic - execution seamlessly leverages updated trajectory]
+        [Unchanged signature and logic to ensure perfect downstream safety]
         """
         os.makedirs(output_dir, exist_ok=True)
 
@@ -277,12 +288,6 @@ class CloudBuilder:
                         embeddings[nn_idx]   += embedding
                         embed_counts[nn_idx] += 1
                         frame_embedded       += 1
-
-            if (ki + 1) % 5 == 0 or ki == 0:
-                print(f"  Keyframe {ki+1}/{len(keyframe_indices)} "
-                      f"(frame {frame_idx}) "
-                      f"— {len(masks)} masks "
-                      f"→ {frame_embedded} embeddings assigned")
 
         has_embed = embed_counts > 0
         embeddings[has_embed] = embeddings[has_embed] / embed_counts[has_embed, np.newaxis]
