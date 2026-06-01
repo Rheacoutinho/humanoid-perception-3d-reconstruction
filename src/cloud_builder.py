@@ -1,11 +1,11 @@
 """
-cloud_builder.py (Anchor-Isolated Version)
-------------------------------------------
+cloud_builder.py (ICP Rigorous Alignment Version)
+------------------------------------------------
 Fuses per-frame depth maps + camera poses into a single 3D point cloud,
 then embeds CLIP features into every point.
 
-Optimized for systems with monocular scale drift by anchoring the geometry
-to high-confidence keyframes to prevent multi-frame smearing.
+Optimised for recognizable object reconstruction by utilizing frame-to-model
+ICP alignment loops to automatically correct monocular camera pose errors.
 """
 
 import numpy as np
@@ -24,6 +24,17 @@ from config import (
     OUTLIER_NEIGHBORS,
     OUTLIER_STD_RATIO,
 )
+
+# Safe cross-version wrapper for Open3D registration APIs
+try:
+    import open3d.pipelines.registration as o3d_reg
+    _ICP_ALIGN = o3d_reg.registration_icp
+    _ICP_ESTIMATE = o3d_reg.TransformationEstimationPointToPoint
+    _ICP_CRITERIA = o3d_reg.ICPConvergenceCriteria
+except (ImportError, AttributeError):
+    _ICP_ALIGN = o3d.registration.registration_icp
+    _ICP_ESTIMATE = o3d.registration.TransformationEstimationPointToPoint
+    _ICP_CRITERIA = o3d.registration.ICPConvergenceCriteria
 
 
 class CloudBuilder:
@@ -79,19 +90,12 @@ class CloudBuilder:
                 depth_m, (self.W, self.H), interpolation=cv2.INTER_LINEAR
             )
 
-        # Basic edge suppression to help sharpen boundaries
-        kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float64)
-        grad_edge = np.sqrt(cv2.filter2D(depth_m, -1, kx)**2 + cv2.filter2D(depth_m, -1, kx.T)**2)
-        stable_mask = grad_edge < (0.04 * depth_m)
-
         d_flat = depth_m.flatten()
-        stable_flat = stable_mask.flatten()
 
         valid = (
             (d_flat >= MIN_DEPTH_M) &
             (d_flat <= MAX_DEPTH_M) &
-            np.isfinite(d_flat) &
-            stable_flat
+            np.isfinite(d_flat)
         )
 
         d = d_flat[valid]
@@ -118,49 +122,70 @@ class CloudBuilder:
         batch_size: int = 10,
     ) -> o3d.geometry.PointCloud:
         """
-        Builds a structurally clean reference cloud by selecting high-stability anchor frames,
-        sidestepping unaligned multi-frame monocular scale drift.
+        Fuse all frames using an incremental frame-to-model ICP registration loop.
+        Corrects pose trajectories in real-time to render crisp, solid 3D structures.
         """
         os.makedirs(output_dir, exist_ok=True)
+        print(f"Building highly-aligned dense point cloud across {len(frame_paths)} frames...")
 
-        print(f"Selecting clean structural geometry anchors from {len(frame_paths)} frames...")
-        
-        # Select 3 evenly spaced structural anchor frames across the sequence
-        # (e.g., beginning, middle, end layout) to sample the scene context without smearing
-        total_frames = len(frame_paths)
-        anchor_indices = [int(total_frames * 0.15), int(total_frames * 0.5), int(total_frames * 0.85)]
-        
-        all_points = []
-        all_colours = []
-        total_raw = 0
+        # Base anchor point cloud initialized from frame 0
+        pcd_global = o3d.geometry.PointCloud()
+        pts_init, cols_init, _ = self.backproject_frame(0, frame_paths[0], depths_dir)
+        pcd_global.points = o3d.utility.Vector3dVector(pts_init.astype(np.float64))
+        pcd_global.colors = o3d.utility.Vector3dVector(cols_init.astype(np.float64) / 255.0)
+        pcd_global = pcd_global.voxel_down_sample(VOXEL_SIZE)
 
-        for idx in anchor_indices:
+        # ICP Search window configuration based on voxel resolution
+        icp_distance_threshold = VOXEL_SIZE * 4.0
+
+        for idx in range(1, len(frame_paths)):
+            # Backproject the upcoming frame with current camera parameters
             pts, cols, _ = self.backproject_frame(idx, frame_paths[idx], depths_dir)
-            all_points.append(pts)
-            all_colours.append(cols)
-            total_raw += len(pts)
+            
+            pcd_source = o3d.geometry.PointCloud()
+            pcd_source.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
+            pcd_source.colors = o3d.utility.Vector3dVector(cols.astype(np.float64) / 255.0)
+            
+            # Create light copy for fast registration calculation
+            pcd_source_down = pcd_source.voxel_down_sample(VOXEL_SIZE)
 
-        merged_pts = np.concatenate(all_points, axis=0)
-        merged_cols = np.concatenate(all_colours, axis=0)
+            # Evaluate alignment transformation matrix
+            reg_result = _ICP_ALIGN(
+                pcd_source_down, pcd_global, icp_distance_threshold, np.identity(4),
+                _ICP_ESTIMATE(),
+                _ICP_CRITERIA(max_iteration=40)
+            )
+            
+            T_icp = reg_result.transformation
+            
+            # Guardrail check: Protect trajectory from slipping in sparse regions
+            if reg_result.fitness > 0.15:
+                # 1. Update global camera orientation to sync CLIP mapping down the line
+                current_pose = np.array(self.poses[idx]["cam_to_world"], dtype=np.float64)
+                self.poses[idx]["cam_to_world"] = T_icp @ current_pose
+                
+                # 2. Adjust frame point placements to fit the target structural profile
+                pcd_source.transform(T_icp)
 
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(merged_pts.astype(np.float64))
-        pcd.colors = o3d.utility.Vector3dVector(merged_cols.astype(np.float64) / 255.0)
+            # Append aligned structural content to reference cloud
+            pcd_global += pcd_source
+            pcd_global = pcd_global.voxel_down_sample(VOXEL_SIZE)
 
-        # Clean up spatial outliers aggressively
-        pcd = pcd.voxel_down_sample(VOXEL_SIZE)
-        pcd, _ = pcd.remove_statistical_outlier(
-            nb_neighbors=int(OUTLIER_NEIGHBORS * 1.5),
-            std_ratio=OUTLIER_STD_RATIO * 0.6
+            if (idx + 1) % 15 == 0 or idx == len(frame_paths) - 1:
+                print(f"  Processed frame {idx+1}/{len(frame_paths)} "
+                      f"→ Global cloud size: {len(pcd_global.points):,} points")
+
+        # Perform clean statistical edge filtering across final dense surfaces
+        print("\nPolishing scene structures...")
+        pcd_global, _ = pcd_global.remove_statistical_outlier(
+            nb_neighbors=OUTLIER_NEIGHBORS,
+            std_ratio=OUTLIER_STD_RATIO
         )
-
-        print(f"  Anchor processing complete.")
-        print(f"  Raw points across anchors: {total_raw:,}")
-        print(f"  Final crisp points: {len(pcd.points):,}")
+        print(f"  Final optimized structural point count: {len(pcd_global.points):,}")
 
         ply_path = os.path.join(output_dir, "pointcloud_rgb.ply")
-        o3d.io.write_point_cloud(ply_path, pcd)
-        return pcd
+        o3d.io.write_point_cloud(ply_path, pcd_global)
+        return pcd_global
 
     def embed_clip_features(
         self,
@@ -173,7 +198,7 @@ class CloudBuilder:
         keyframe_step: int = 5,
     ) -> dict:
         """
-        [Unchanged signature and logic to ensure perfect pipeline execution]
+        [Unchanged signature and logic - execution seamlessly leverages updated trajectory]
         """
         os.makedirs(output_dir, exist_ok=True)
 
@@ -253,6 +278,12 @@ class CloudBuilder:
                         embed_counts[nn_idx] += 1
                         frame_embedded       += 1
 
+            if (ki + 1) % 5 == 0 or ki == 0:
+                print(f"  Keyframe {ki+1}/{len(keyframe_indices)} "
+                      f"(frame {frame_idx}) "
+                      f"— {len(masks)} masks "
+                      f"→ {frame_embedded} embeddings assigned")
+
         has_embed = embed_counts > 0
         embeddings[has_embed] = embeddings[has_embed] / embed_counts[has_embed, np.newaxis]
 
@@ -268,7 +299,6 @@ class CloudBuilder:
             embeddings  = embeddings,
             embed_counts = embed_counts,
         )
-        
         return {
             "points": pts_all,
             "colours": cols_all,
