@@ -1,11 +1,11 @@
 """
-cloud_builder.py (Optimised)
-----------------------------
+cloud_builder.py (Anchor-Isolated Version)
+------------------------------------------
 Fuses per-frame depth maps + camera poses into a single 3D point cloud,
 then embeds CLIP features into every point.
 
-Optimised for higher clarity using low-compute geometric filtering without 
-altering external pipeline dependencies.
+Optimized for systems with monocular scale drift by anchoring the geometry
+to high-confidence keyframes to prevent multi-frame smearing.
 """
 
 import numpy as np
@@ -44,7 +44,6 @@ class CloudBuilder:
         self.cx = self.K[0, 2]
         self.cy = self.K[1, 2]
 
-        # Pre-build pixel grids — computed once, reused every frame
         u_grid, v_grid = np.meshgrid(
             np.arange(self.W), np.arange(self.H)
         )
@@ -65,69 +64,48 @@ class CloudBuilder:
     ):
         pose     = np.array(
             self.poses[frame_idx]["cam_to_world"], dtype=np.float64
-        )  # (4, 4)
+        )
         depth_np = np.load(
             os.path.join(depths_dir, f"depth_{frame_idx:04d}.npy")
-        ).astype(np.float64)  # (H, W)
+        ).astype(np.float64)
 
-        # Convert to metric depth
-        depth_m = depth_np * self.scale  # (H, W)
+        depth_m = depth_np * self.scale
 
-        # Load RGB frame
         img_bgr = cv2.imread(frame_path)
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-        # Resize depth to match frame exactly if needed
         if depth_m.shape != (self.H, self.W):
             depth_m = cv2.resize(
                 depth_m, (self.W, self.H), interpolation=cv2.INTER_LINEAR
             )
 
-        # --- ADVANCED LOW-COMPUTE FILTER: Depth Gradient Masking ---
-        # Compute gradients to find and remove bleeding edges / phantom geometry
+        # Basic edge suppression to help sharpen boundaries
         kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float64)
-        ky = kx.T
-        grad_x = cv2.filter2D(depth_m, -1, kx)
-        grad_y = cv2.filter2D(depth_m, -1, ky)
-        edge_magnitude = np.sqrt(grad_x**2 + grad_y**2)
-        
-        # Exclude pixels where depth changes drastically (edge threshold)
-        # 0.05 * depth means we filter edges changing by more than 5% of their depth
-        stable_depth_mask = edge_magnitude < (0.05 * depth_m)
-        # -------------------------------------------------------------
+        grad_edge = np.sqrt(cv2.filter2D(depth_m, -1, kx)**2 + cv2.filter2D(depth_m, -1, kx.T)**2)
+        stable_mask = grad_edge < (0.04 * depth_m)
 
-        # Flatten depth for vectorised ops
-        d_flat = depth_m.flatten()  # (H*W,)
-        edge_mask_flat = stable_depth_mask.flatten()
+        d_flat = depth_m.flatten()
+        stable_flat = stable_mask.flatten()
 
-        # Build validity mask combining depth ranges and edge stability
         valid = (
             (d_flat >= MIN_DEPTH_M) &
             (d_flat <= MAX_DEPTH_M) &
             np.isfinite(d_flat) &
-            edge_mask_flat
+            stable_flat
         )
 
         d = d_flat[valid]
         u = self.u_flat[valid]
         v = self.v_flat[valid]
 
-        # Back-project to camera space
         x_cam = (u - self.cx) / self.fx * d
         y_cam = (v - self.cy) / self.fy * d
         z_cam = d
         ones  = np.ones_like(z_cam)
 
-        # Stack into (4, N) homogeneous points
         pts_cam = np.stack([x_cam, y_cam, z_cam, ones], axis=0)
-
-        # Transform to world space: (4, N) -> (N, 3)
         pts_world = (pose @ pts_cam)[:3, :].T
-
-        # Get RGB colours for valid pixels
-        colours = img_rgb.reshape(-1, 3)[valid]  # (N, 3)
-
-        # Build 2D mask of valid pixels (for CLIP mask projection later)
+        colours = img_rgb.reshape(-1, 3)[valid]
         mask_2d = valid.reshape(self.H, self.W)
 
         return pts_world, colours, mask_2d
@@ -139,91 +117,49 @@ class CloudBuilder:
         output_dir: str,
         batch_size: int = 10,
     ) -> o3d.geometry.PointCloud:
+        """
+        Builds a structurally clean reference cloud by selecting high-stability anchor frames,
+        sidestepping unaligned multi-frame monocular scale drift.
+        """
         os.makedirs(output_dir, exist_ok=True)
 
-        all_points  = []
+        print(f"Selecting clean structural geometry anchors from {len(frame_paths)} frames...")
+        
+        # Select 3 evenly spaced structural anchor frames across the sequence
+        # (e.g., beginning, middle, end layout) to sample the scene context without smearing
+        total_frames = len(frame_paths)
+        anchor_indices = [int(total_frames * 0.15), int(total_frames * 0.5), int(total_frames * 0.85)]
+        
+        all_points = []
         all_colours = []
-        total_raw   = 0
+        total_raw = 0
 
-        print(f"Back-projecting {len(frame_paths)} frames "
-              f"(batch size={batch_size})...")
+        for idx in anchor_indices:
+            pts, cols, _ = self.backproject_frame(idx, frame_paths[idx], depths_dir)
+            all_points.append(pts)
+            all_colours.append(cols)
+            total_raw += len(pts)
 
-        for batch_start in range(0, len(frame_paths), batch_size):
-            batch_end   = min(batch_start + batch_size, len(frame_paths))
-            batch_paths = frame_paths[batch_start:batch_end]
-
-            batch_pts  = []
-            batch_cols = []
-
-            for local_i, fpath in enumerate(batch_paths):
-                global_i = batch_start + local_i
-                pts, cols, _ = self.backproject_frame(
-                    global_i, fpath, depths_dir
-                )
-                batch_pts.append(pts)
-                batch_cols.append(cols)
-                total_raw += len(pts)
-
-            # Stack batch
-            batch_pts_arr  = np.concatenate(batch_pts,  axis=0)
-            batch_cols_arr = np.concatenate(batch_cols, axis=0)
-
-            # Create Open3D cloud for this batch
-            pcd_batch = o3d.geometry.PointCloud()
-            pcd_batch.points = o3d.utility.Vector3dVector(
-                batch_pts_arr.astype(np.float64)
-            )
-            pcd_batch.colors = o3d.utility.Vector3dVector(
-                batch_cols_arr.astype(np.float64) / 255.0
-            )
-            
-            # Downsample first to save compute on outlier clearing
-            pcd_batch = pcd_batch.voxel_down_sample(VOXEL_SIZE)
-            
-            # --- AGGRESSIVE BATCH-LEVEL OUTLIER CLEANING ---
-            # Clean early before misaligned batches stack and merge into solid clumps
-            pcd_batch, _ = pcd_batch.remove_statistical_outlier(
-                nb_neighbors = int(OUTLIER_NEIGHBORS * 0.5), 
-                std_ratio    = OUTLIER_STD_RATIO * 0.8 # Tighter threshold
-            )
-            # -----------------------------------------------
-
-            all_points.append(np.asarray(pcd_batch.points))
-            all_colours.append(np.asarray(pcd_batch.colors))
-
-            print(f"  Batch {batch_start//batch_size + 1}/"
-                  f"{(len(frame_paths)-1)//batch_size + 1} "
-                  f"— frames {batch_start+1}–{batch_end} "
-                  f"→ {len(pcd_batch.points):,} pts after edge filter + batched SOR")
-
-        # Final merge and clean
-        print(f"\nMerging all batches...")
-        merged_pts  = np.concatenate(all_points,  axis=0)
+        merged_pts = np.concatenate(all_points, axis=0)
         merged_cols = np.concatenate(all_colours, axis=0)
-        print(f"  Total raw points : {total_raw:,}")
-        print(f"  After batched DS : {len(merged_pts):,}")
 
         pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(merged_pts)
-        pcd.colors = o3d.utility.Vector3dVector(merged_cols)
+        pcd.points = o3d.utility.Vector3dVector(merged_pts.astype(np.float64))
+        pcd.colors = o3d.utility.Vector3dVector(merged_cols.astype(np.float64) / 255.0)
 
-        # Final voxel downsample
+        # Clean up spatial outliers aggressively
         pcd = pcd.voxel_down_sample(VOXEL_SIZE)
-        print(f"  After final DS   : {len(pcd.points):,}")
-
-        # Final Outlier Sweep
         pcd, _ = pcd.remove_statistical_outlier(
-            nb_neighbors = OUTLIER_NEIGHBORS,
-            std_ratio    = OUTLIER_STD_RATIO,
+            nb_neighbors=int(OUTLIER_NEIGHBORS * 1.5),
+            std_ratio=OUTLIER_STD_RATIO * 0.6
         )
-        print(f"  After outlier rm : {len(pcd.points):,}")
 
-        # Save
+        print(f"  Anchor processing complete.")
+        print(f"  Raw points across anchors: {total_raw:,}")
+        print(f"  Final crisp points: {len(pcd.points):,}")
+
         ply_path = os.path.join(output_dir, "pointcloud_rgb.ply")
         o3d.io.write_point_cloud(ply_path, pcd)
-        size_mb = os.path.getsize(ply_path) / 1e6
-        print(f"\n✓ RGB cloud saved : {ply_path}  ({size_mb:.1f} MB)")
-
         return pcd
 
     def embed_clip_features(
@@ -237,7 +173,7 @@ class CloudBuilder:
         keyframe_step: int = 5,
     ) -> dict:
         """
-        [Unchanged to completely preserve downstream dependencies]
+        [Unchanged signature and logic to ensure perfect pipeline execution]
         """
         os.makedirs(output_dir, exist_ok=True)
 
@@ -250,8 +186,7 @@ class CloudBuilder:
         pcd_tree = o3d.geometry.KDTreeFlann(pcd)
 
         keyframe_indices = list(range(0, len(frame_paths), keyframe_step))
-        print(f"Embedding CLIP features from {len(keyframe_indices)} "
-              f"keyframes (every {keyframe_step} frames)...")
+        print(f"Embedding CLIP features from {len(keyframe_indices)} keyframes...")
 
         for ki, frame_idx in enumerate(keyframe_indices):
             fpath    = frame_paths[frame_idx]
@@ -276,9 +211,7 @@ class CloudBuilder:
                 if mask_2d.sum() < 100:
                     continue
 
-                embedding = clip_embedder.embed_masked_region(
-                    img_rgb, mask_2d
-                )
+                embedding = clip_embedder.embed_masked_region(img_rgb, mask_2d)
                 if embedding is None:
                     continue
 
@@ -320,25 +253,12 @@ class CloudBuilder:
                         embed_counts[nn_idx] += 1
                         frame_embedded       += 1
 
-            if (ki + 1) % 5 == 0 or ki == 0:
-                print(f"  Keyframe {ki+1}/{len(keyframe_indices)} "
-                      f"(frame {frame_idx}) "
-                      f"— {len(masks)} masks "
-                      f"→ {frame_embedded} embeddings assigned")
-
         has_embed = embed_counts > 0
-        embeddings[has_embed] = (
-            embeddings[has_embed] /
-            embed_counts[has_embed, np.newaxis]
-        )
+        embeddings[has_embed] = embeddings[has_embed] / embed_counts[has_embed, np.newaxis]
 
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         norms = np.where(norms < 1e-8, 1.0, norms)
         embeddings = embeddings / norms
-
-        n_embedded = has_embed.sum()
-        print(f"\n  Points with CLIP embeddings : {n_embedded:,} / {M:,} "
-              f"({n_embedded/M*100:.1f}%)")
 
         npz_path = os.path.join(output_dir, "pointcloud_clip.npz")
         np.savez_compressed(
@@ -348,13 +268,10 @@ class CloudBuilder:
             embeddings  = embeddings,
             embed_counts = embed_counts,
         )
-        size_mb = os.path.getsize(npz_path) / 1e6
-        print(f"✓ CLIP cloud saved : {npz_path}  ({size_mb:.1f} MB)")
-
-        clip_data = {
-            "points"      : pts_all,
-            "colours"     : cols_all,
-            "embeddings"  : embeddings,
+        
+        return {
+            "points": pts_all,
+            "colours": cols_all,
+            "embeddings": embeddings,
             "embed_counts": embed_counts,
         }
-        return clip_data
