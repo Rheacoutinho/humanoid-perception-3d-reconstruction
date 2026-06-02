@@ -310,8 +310,13 @@ class Pipeline:
         if os.path.exists(self.paths["query_npz"]):
             progress("CLIP", 80, "Loaded cached embeddings")
         else:
+	    import open3d as o3d 
             from segmentor      import Segmentor
             from clip_embedder  import CLIPEmbedder
+		
+		# Reload pcd if not in scope (e.g. after cache hit in Stage 4)
+            if not hasattr(locals(), 'pcd') or pcd is None:
+                pcd = o3d.io.read_point_cloud(self.paths["rgb_ply"])
 
             pts_all  = np.asarray(pcd.points,  dtype=np.float32)
             cols_all = np.asarray(pcd.colors,  dtype=np.float32)

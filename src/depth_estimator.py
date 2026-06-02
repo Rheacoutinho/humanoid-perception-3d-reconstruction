@@ -100,7 +100,6 @@ class DepthEstimator:
         d_max = depth.max()
         if d_max > 1.0:
             depth = depth / d_max
-
         return depth
 
     def estimate_batch(

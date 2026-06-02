@@ -144,7 +144,7 @@ def process_video(
     """
     global _pipeline, _result, _embedder
 
-    if video_file is None:
+     if not video_file or (isinstance(video_file, str) and not os.path.exists(video_file)):
         return (
             None, None,
             "❌ Please upload a video first.",
@@ -185,6 +185,11 @@ def process_video(
                     "",
                 )
 
+	 if isinstance(video_file, dict):
+            video_path = video_file.get("name", video_file.get("path", ""))
+         else:
+           video_path = str(video_file)
+
         _pipeline = Pipeline(
             output_dir   = output_dir_path,
             fastsam_ckpt = ckpt,
@@ -199,7 +204,7 @@ def process_video(
 
         progress(0.05, desc="Starting pipeline...")
         _result = _pipeline.run(
-            video_path  = video_file,
+            video_path  = video_path,
             progress_cb = progress_cb,
         )
 
@@ -248,7 +253,7 @@ def process_video(
         scene_summary = _pipeline.get_scene_summary()
 
         progress(1.0, desc="Done!")
-        return cloud_img, cloud_img, summary, scene_summary
+        return cloud_img, summary, scene_summary
 
     except Exception as e:
         import traceback
@@ -597,8 +602,7 @@ def build_app(
                 fn      = process_video,
                 inputs  = [video_input, ckpt_input,
                            groq_input, outdir_input],
-                outputs = [cloud_output, cloud_output,
-                          status_output, scene_preview],
+                outputs = [cloud_output, status_output, scene_preview],
             )
 
         # ── Tab 2: Query ──────────────────────────────────────────────────────
