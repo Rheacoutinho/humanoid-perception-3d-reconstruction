@@ -1,12 +1,16 @@
-"""
+import os
+
+PIPELINE_PATH = "/content/humanoid-perception-3d-reconstruction/src/pipeline.py"
+
+# Write the complete correct pipeline.py directly
+with open(PIPELINE_PATH, "w") as f:
+    f.write('''"""
 pipeline.py
 -----------
 Single entry point that orchestrates the entire pipeline.
 
-Call run_pipeline(video_path, output_dir) and get back
-a fully queryable 3D scene.
-
-This is what the Gradio app calls internally.
+Call Pipeline(output_dir, fastsam_ckpt).run(video_path) and get back
+a fully queryable 3D scene. This is what the Gradio app calls internally.
 """
 
 import os
@@ -27,16 +31,15 @@ from config import (
 def extract_frames_inline(
     video_path: str,
     output_dir: str,
-    num_frames: int = NUM_FRAMES,
-    max_side: int   = MAX_SIDE_PX,
-    sharpness: float = SHARPNESS_THRESHOLD,
-    min_frames: int  = MIN_FRAMES,
+    num_frames: int   = NUM_FRAMES,
+    max_side: int     = MAX_SIDE_PX,
+    sharpness: float  = SHARPNESS_THRESHOLD,
+    min_frames: int   = MIN_FRAMES,
 ) -> dict:
-    """Extract frames from video — inline version for pipeline use."""
+    """Extract frames from video -- inline version for pipeline use."""
     os.makedirs(output_dir, exist_ok=True)
     metadata_path = os.path.join(output_dir, "frames_metadata.json")
 
-    # Return cached result if already done
     if os.path.exists(metadata_path):
         with open(metadata_path) as f:
             meta = json.load(f)
@@ -48,7 +51,7 @@ def extract_frames_inline(
     fps   = cap.get(cv2.CAP_PROP_FPS)
     dur   = total / fps if fps > 0 else 0
 
-    indices = np.linspace(0, total-1, min(num_frames, total),
+    indices = np.linspace(0, total - 1, min(num_frames, total),
                           dtype=int).tolist()
     indices = list(dict.fromkeys(indices))
 
@@ -65,7 +68,7 @@ def extract_frames_inline(
 
     threshold = sharpness
     while True:
-        kept = [(i,s,f) for i,s,f in candidates if s >= threshold]
+        kept = [(i, s, f) for i, s, f in candidates if s >= threshold]
         if len(kept) >= min_frames or threshold <= 5.0:
             break
         threshold *= 0.75
@@ -78,7 +81,7 @@ def extract_frames_inline(
         h, w  = bgr.shape[:2]
         scale = max_side / max(h, w)
         if scale < 1.0:
-            bgr = cv2.resize(bgr, (int(w*scale), int(h*scale)),
+            bgr = cv2.resize(bgr, (int(w * scale), int(h * scale)),
                              interpolation=cv2.INTER_AREA)
         fname = f"frame_{i:04d}.png"
         cv2.imwrite(os.path.join(output_dir, fname), bgr)
@@ -102,30 +105,16 @@ def extract_frames_inline(
 class Pipeline:
     """
     Orchestrates the full 3D scene understanding pipeline.
-
-    Usage:
-        pipeline = Pipeline(output_dir="output/my_scene")
-        result   = pipeline.run(video_path="room.mp4")
-        answer   = pipeline.query("where is the chair?")
     """
 
     def __init__(
         self,
-        output_dir    : str,
-        fastsam_ckpt  : str,
-        groq_api_key  : str = "",
-        hf_api_token  : str = "",
-        device        : str = None,
+        output_dir   : str,
+        fastsam_ckpt : str,
+        groq_api_key : str = "",
+        hf_api_token : str = "",
+        device       : str = None,
     ):
-        """
-        Parameters
-        ----------
-        output_dir   : where to save all outputs
-        fastsam_ckpt : path to FastSAM-s.pt checkpoint
-        groq_api_key : optional Groq API key for VLM descriptions
-        hf_api_token : optional HuggingFace token (fallback VLM)
-        device       : "cuda", "cpu", or None (auto)
-        """
         import torch
 
         self.output_dir   = output_dir
@@ -136,13 +125,11 @@ class Pipeline:
 
         os.makedirs(output_dir, exist_ok=True)
 
-        # Set API keys in environment
         if groq_api_key:
             os.environ["GROQ_API_KEY"] = groq_api_key
         if hf_api_token:
             os.environ["HF_API_TOKEN"] = hf_api_token
 
-        # Output paths
         self.paths = {
             "frames_dir"   : os.path.join(output_dir, "frames"),
             "depths_dir"   : os.path.join(output_dir, "depths"),
@@ -155,7 +142,6 @@ class Pipeline:
                                           "frames_metadata.json"),
         }
 
-        # State — loaded lazily
         self._engine   = None
         self._embedder = None
 
@@ -169,21 +155,11 @@ class Pipeline:
         progress_cb   = None,
         keyframe_step : int = 5,
     ) -> dict:
-        """
-        Run the full pipeline on a video file.
+        import gc
+        import torch
 
-        Parameters
-        ----------
-        video_path    : path to input video
-        progress_cb   : optional callback(stage, pct, message)
-                        called at each stage for UI progress updates
-        keyframe_step : process every Nth frame for CLIP embedding
-
-        Returns
-        -------
-        result : dict with paths to all outputs and timing info
-        """
         t_start = time.time()
+        pcd     = None  # initialised here so Stage 6 can safely check it
 
         def progress(stage, pct, msg):
             elapsed = time.time() - t_start
@@ -206,19 +182,19 @@ class Pipeline:
             os.path.join(self.paths["frames_dir"], f)
             for f in frame_files
         ]
-        progress("Frames", 10,
-                 f"{meta['frames_kept']} frames extracted")
+        progress("Frames", 10, f"{meta[\'frames_kept\']} frames extracted")
 
         # ── Stage 2: Depth estimation ─────────────────────────────────────────
         progress("Depth", 15, "Loading Depth-Anything V2")
         from depth_estimator import DepthEstimator, compute_global_scale
-        depth_est = DepthEstimator(device=self.device)
 
+        depth_est = DepthEstimator(device=self.device)
         progress("Depth", 20, "Estimating depth for all frames")
         os.makedirs(self.paths["depths_dir"], exist_ok=True)
+
         depth_stats = depth_est.estimate_batch(
-            frame_paths = frame_paths,
-            output_dir  = self.paths["depths_dir"],
+            frame_paths   = frame_paths,
+            output_dir    = self.paths["depths_dir"],
             show_progress = False,
         )
         global_scale = compute_global_scale(
@@ -226,11 +202,10 @@ class Pipeline:
         )
 
         del depth_est
-        import gc, torch
         gc.collect()
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-        progress("Depth", 30,
-                 f"Scale={global_scale:.4f}")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        progress("Depth", 30, f"Scale={global_scale:.4f}")
 
         # ── Stage 3: Pose estimation ──────────────────────────────────────────
         progress("Poses", 32, "Estimating camera poses")
@@ -238,9 +213,13 @@ class Pipeline:
         if os.path.exists(self.paths["poses_json"]):
             with open(self.paths["poses_json"]) as f:
                 poses_data = json.load(f)
+            # Ensure scale is stored in poses_data
+            if "scale" not in poses_data:
+                poses_data["scale"] = float(global_scale)
+                with open(self.paths["poses_json"], "w") as f:
+                    json.dump(poses_data, f, indent=2)
             progress("Poses", 40,
-                     f"Loaded cached poses "
-                     f"({poses_data['pnp_success_pct']}% PnP)")
+                     f"Loaded cached ({poses_data[\'pnp_success_pct\']}% PnP)")
         else:
             sample_img = cv2.imread(frame_paths[0])
             H, W = sample_img.shape[:2]
@@ -257,7 +236,7 @@ class Pipeline:
             del pose_est
             gc.collect()
             progress("Poses", 40,
-                     f"{poses_data['pnp_success_pct']}% PnP success")
+                     f"{poses_data[\'pnp_success_pct\']}% PnP success")
 
         # ── Stage 4: Point cloud fusion ───────────────────────────────────────
         progress("Cloud", 42, "Building RGB point cloud")
@@ -267,8 +246,7 @@ class Pipeline:
         if os.path.exists(self.paths["rgb_ply"]):
             pcd = o3d.io.read_point_cloud(self.paths["rgb_ply"])
             progress("Cloud", 50,
-                     f"Loaded cached cloud "
-                     f"({len(pcd.points):,} pts)")
+                     f"Loaded cached ({len(pcd.points):,} pts)")
         else:
             builder = CloudBuilder(poses_data)
             pcd     = builder.build_rgb_cloud(
@@ -279,8 +257,7 @@ class Pipeline:
             )
             del builder
             gc.collect()
-            progress("Cloud", 50,
-                     f"{len(pcd.points):,} points")
+            progress("Cloud", 50, f"{len(pcd.points):,} points")
 
         # ── Stage 5: VLM scene description ───────────────────────────────────
         progress("VLM", 52, "Generating scene description")
@@ -290,8 +267,7 @@ class Pipeline:
             with open(self.paths["scene_desc"]) as f:
                 scene_desc = json.load(f)
             progress("VLM", 58,
-                     f"Loaded cached: "
-                     f"{len(scene_desc.get('objects',[]))} objects")
+                     f"Cached: {len(scene_desc.get(\'objects\', []))} objects")
         else:
             describer  = VLMDescriber()
             scene_desc = describer.describe_scene(
@@ -302,7 +278,7 @@ class Pipeline:
             del describer
             gc.collect()
             progress("VLM", 58,
-                     f"{len(scene_desc.get('objects',[]))} objects found")
+                     f"{len(scene_desc.get(\'objects\', []))} objects found")
 
         # ── Stage 6: CLIP embedding ───────────────────────────────────────────
         progress("CLIP", 60, "Embedding CLIP features")
@@ -310,14 +286,18 @@ class Pipeline:
         if os.path.exists(self.paths["query_npz"]):
             progress("CLIP", 80, "Loaded cached embeddings")
         else:
-            from segmentor      import Segmentor
-            from clip_embedder  import CLIPEmbedder
+            import open3d as o3d
+            from segmentor     import Segmentor
+            from clip_embedder import CLIPEmbedder
 
-            pts_all  = np.asarray(pcd.points,  dtype=np.float32)
-            cols_all = np.asarray(pcd.colors,  dtype=np.float32)
+            if pcd is None:
+                pcd = o3d.io.read_point_cloud(self.paths["rgb_ply"])
+
+            pts_all  = np.asarray(pcd.points, dtype=np.float32)
+            cols_all = np.asarray(pcd.colors, dtype=np.float32)
             pcd_ds   = pcd.voxel_down_sample(0.03)
-            pts_ds   = np.asarray(pcd_ds.points,  dtype=np.float32)
-            cols_ds  = np.asarray(pcd_ds.colors,  dtype=np.float32)
+            pts_ds   = np.asarray(pcd_ds.points, dtype=np.float32)
+            cols_ds  = np.asarray(pcd_ds.colors, dtype=np.float32)
             M        = len(pts_ds)
 
             mask_ids       = np.full(M, -1, dtype=np.int32)
@@ -326,47 +306,50 @@ class Pipeline:
             all_mask_confs = []
             global_mid     = 0
 
-            pcd_tree_o3d = o3d.geometry.PointCloud()
+            pcd_tree_o3d        = o3d.geometry.PointCloud()
             pcd_tree_o3d.points = o3d.utility.Vector3dVector(
                 pts_ds.astype(np.float64)
             )
             kd = o3d.geometry.KDTreeFlann(pcd_tree_o3d)
 
-            fx = np.array(poses_data["K"])[0,0]
-            fy = np.array(poses_data["K"])[1,1]
-            cx = np.array(poses_data["K"])[0,2]
-            cy = np.array(poses_data["K"])[1,2]
+            fx  = np.array(poses_data["K"])[0, 0]
+            fy  = np.array(poses_data["K"])[1, 1]
+            cx_ = np.array(poses_data["K"])[0, 2]
+            cy_ = np.array(poses_data["K"])[1, 2]
 
             kf_indices = list(range(0, len(frame_paths), keyframe_step))
 
             for ki, fidx in enumerate(kf_indices):
-                progress("CLIP", 60 + int(20 * ki/len(kf_indices)),
+                progress("CLIP", 60 + int(20 * ki / len(kf_indices)),
                          f"Keyframe {ki+1}/{len(kf_indices)}")
 
-                seg = Segmentor(checkpoint_path=self.fastsam_ckpt)
+                seg     = Segmentor(checkpoint_path=self.fastsam_ckpt)
                 img_bgr = cv2.imread(frame_paths[fidx])
                 img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
                 H2, W2  = img_bgr.shape[:2]
                 masks   = seg.segment(img_bgr)
-                del seg; gc.collect()
+                del seg
+                gc.collect()
 
                 if not masks:
                     continue
 
                 clip_emb = CLIPEmbedder(device=self.device)
-                d_np = np.load(os.path.join(
+                d_np     = np.load(os.path.join(
                     self.paths["depths_dir"],
                     f"depth_{fidx:04d}.npy"
                 )).astype(np.float64) * global_scale
+
                 if d_np.shape != (H2, W2):
                     d_np = cv2.resize(d_np, (W2, H2))
+
                 pose = np.array(
                     poses_data["poses"][fidx]["cam_to_world"],
                     dtype=np.float64
                 )
                 ug, vg = np.meshgrid(np.arange(W2), np.arange(H2))
-                uf = ug.flatten().astype(np.float64)
-                vf = vg.flatten().astype(np.float64)
+                uf     = ug.flatten().astype(np.float64)
+                vf     = vg.flatten().astype(np.float64)
 
                 for msk in masks:
                     if msk.sum() < 100:
@@ -377,50 +360,52 @@ class Pipeline:
                     lbl = clip_emb.label_mask(img_rgb, msk)
                     mf  = msk.flatten()
                     dv  = d_np.flatten()[mf]
-                    uv  = uf[mf]; vv = vf[mf]
+                    uv  = uf[mf]
+                    vv  = vf[mf]
                     ok  = (dv >= 0.1) & (dv <= 6.0) & np.isfinite(dv)
                     if ok.sum() < 10:
                         continue
-                    xc = (uv[ok]-cx)/fx*dv[ok]
-                    yc = (vv[ok]-cy)/fy*dv[ok]
-                    zc = dv[ok]
-                    pts_c = np.stack([xc,yc,zc,np.ones_like(zc)])
+                    xc    = (uv[ok] - cx_) / fx * dv[ok]
+                    yc    = (vv[ok] - cy_) / fy * dv[ok]
+                    zc    = dv[ok]
+                    pts_c = np.stack([xc, yc, zc, np.ones_like(zc)])
                     pts_w = (pose @ pts_c)[:3].T
-                    step  = max(1, len(pts_w)//200)
+                    step  = max(1, len(pts_w) // 200)
                     for pt in pts_w[::step]:
                         _, nn, dsq = kd.search_knn_vector_3d(
                             pt.astype(np.float64), 1
                         )
-                        if dsq[0]**0.5 < 0.15:
+                        if dsq[0] ** 0.5 < 0.25:
                             mask_ids[nn[0]] = global_mid
                     all_mask_embs.append(emb)
                     all_mask_labs.append(lbl["label"])
                     all_mask_confs.append(lbl["confidence"])
                     global_mid += 1
 
-                del clip_emb; gc.collect()
+                del clip_emb
+                gc.collect()
 
-            # Keep assigned + background
             assigned_idx   = np.where(mask_ids >= 0)[0]
             unassigned_idx = np.where(mask_ids < 0)[0]
             bg_n   = min(50_000, len(unassigned_idx))
-            bg_idx = np.random.choice(unassigned_idx, bg_n,
-                                      replace=False) if bg_n > 0 else []
-            keep   = np.sort(
-                np.concatenate([assigned_idx,
-                                np.array(bg_idx, dtype=np.int32)])
+            bg_idx = (
+                np.random.choice(unassigned_idx, bg_n, replace=False)
+                if bg_n > 0
+                else np.array([], dtype=np.int32)
             )
+            keep = np.sort(np.concatenate([
+                assigned_idx,
+                np.array(bg_idx, dtype=np.int32),
+            ]))
 
             np.savez_compressed(
                 self.paths["query_npz"],
                 points           = pts_ds[keep],
                 colours          = cols_ds[keep],
                 mask_ids         = mask_ids[keep],
-                mask_embeddings  = np.array(all_mask_embs,
-                                            dtype=np.float32),
+                mask_embeddings  = np.array(all_mask_embs, dtype=np.float32),
                 mask_labels      = np.array(all_mask_labs),
-                mask_confidences = np.array(all_mask_confs,
-                                            dtype=np.float32),
+                mask_confidences = np.array(all_mask_confs, dtype=np.float32),
             )
             del pts_ds, cols_ds, mask_ids
             gc.collect()
@@ -429,9 +414,7 @@ class Pipeline:
 
         # ── Stage 7: Accuracy report ──────────────────────────────────────────
         progress("Accuracy", 82, "Computing accuracy metrics")
-        from accuracy import run_full_accuracy_report
-
-        # Load query engine for accuracy
+        from accuracy      import run_full_accuracy_report
         from query_engine  import QueryEngine
         from clip_embedder import CLIPEmbedder
 
@@ -457,35 +440,25 @@ class Pipeline:
 
         t_total = time.time() - t_start
         progress("Done", 100,
-                 f"Complete in {t_total:.1f}s — "
-                 f"score={report['overall_score']}/100")
+                 f"Complete in {t_total:.1f}s "
+                 f"-- score={report[\'overall_score\']}/100")
 
         return {
             "scene_description" : scene_desc,
             "accuracy_report"   : report,
             "output_paths"      : self.paths,
             "n_frames"          : meta["frames_kept"],
-            "n_points"          : len(np.load(
-                self.paths["query_npz"])["points"]),
-            "n_masks"           : len(np.load(
-                self.paths["query_npz"],
-                allow_pickle=True)["mask_embeddings"]),
+            "n_points"          : len(
+                np.load(self.paths["query_npz"])["points"]
+            ),
+            "n_masks"           : len(
+                np.load(self.paths["query_npz"],
+                        allow_pickle=True)["mask_embeddings"]
+            ),
             "processing_time_s" : round(t_total, 1),
         }
 
     def query(self, text: str, top_k: int = 500) -> dict:
-        """
-        Query the scene after pipeline.run() has been called.
-
-        Parameters
-        ----------
-        text  : natural language query
-        top_k : number of points to return
-
-        Returns
-        -------
-        result dict from QueryEngine.query()
-        """
         if self._engine is None or self._embedder is None:
             raise RuntimeError(
                 "Call pipeline.run(video_path) before query()"
@@ -493,22 +466,34 @@ class Pipeline:
         return self._engine.query(text, self._embedder, top_k=top_k)
 
     def get_scene_summary(self) -> str:
-        """Return a human-readable scene summary string."""
         if not os.path.exists(self.paths["scene_desc"]):
             return "No scene description available. Run pipeline first."
 
         with open(self.paths["scene_desc"]) as f:
             sd = json.load(f)
 
-        objects  = [o["name"] for o in sd.get("objects", [])]
-        layout   = sd.get("layout", "")
-        nav      = sd.get("navigable_regions", [])
-        obstacles = sd.get("obstacles", [])
+        objects   = [o["name"] for o in sd.get("objects",           [])]
+        layout    = sd.get("layout",            "")
+        nav       = sd.get("navigable_regions", [])
+        obstacles = sd.get("obstacles",         [])
 
         lines = [
             f"Layout   : {layout}",
-            f"Objects  : {', '.join(objects[:10])}",
-            f"Navigate : {', '.join(nav[:3])}",
-            f"Obstacles: {', '.join(obstacles[:5])}",
+            f"Objects  : {\', \'.join(objects[:10])}",
+            f"Navigate : {\', \'.join(nav[:3])}",
+            f"Obstacles: {\', \'.join(obstacles[:5])}",
         ]
-        return "\n".join(lines)
+        return "\\n".join(lines)
+''')
+
+print("✓ pipeline.py written cleanly")
+
+# Verify it parses without errors
+import ast
+with open(PIPELINE_PATH) as f:
+    source = f.read()
+try:
+    ast.parse(source)
+    print("✓ Syntax check passed")
+except SyntaxError as e:
+    print(f"✗ Syntax error at line {e.lineno}: {e.msg}")
