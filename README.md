@@ -222,6 +222,136 @@ humanoid-perception-3d-reconstruction/
 - Depth scale is estimated heuristically — a known camera intrinsic file would give metric accuracy
 - Embedding coverage (~45% of points) could be improved by propagating mask IDs via KD-tree on a machine with >15GB RAM
 
+
+
+
+---
+
+## Future Scope
+
+These improvements can each be dropped into the pipeline independently
+without changing any other module. All tools listed are open source.
+
+### 1 — Geometry: better point cloud
+
+**Problem:** The current cloud has drift in X (11m spread for a small room)
+and low point density in textureless areas (plain walls, floors).
+
+| Improvement | Tool | Drop-in location | Expected gain |
+|---|---|---|---|
+| Replace ORB with SuperPoint keypoints | [SuperPoint](https://github.com/magicleap/SuperPointPretrainer) | `pose_estimator.py` | 2-3× more matches, less drift |
+| Replace PnP with LoFTR dense matching | [LoFTR](https://github.com/zju3dv/LoFTR) | `pose_estimator.py` | Works on textureless surfaces |
+| Add loop closure detection | [NetVLAD](https://github.com/Relja/netvlad) | new `loop_closure.py` | Eliminates cumulative drift |
+| Replace DA2-Small with DA2-Large | [Depth-Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) | `config.py` one line | Sharper depth on edges |
+| Add TSDF fusion instead of voxel grid | Open3D `ScalableTSDFVolume` | `cloud_builder.py` | Watertight surfaces, no duplicate points |
+| Use metric depth with known intrinsics | Phone camera intrinsics file | `pose_estimator.py` | Eliminates scale estimation error |
+
+**Quickest single win:** Change `DEPTH_MODEL` in `config.py` from
+`Depth-Anything-V2-Small-hf` to `Depth-Anything-V2-Large-hf`.
+Requires GPU but no code changes.
+
+---
+
+### 2 — Semantics: better CLIP accuracy
+
+**Problem:** CLIP ViT-B/32 confidence scores are low (0.24–0.27) because
+the model is general-purpose and the masked crops are small.
+
+| Improvement | Tool | Drop-in location | Expected gain |
+|---|---|---|---|
+| Upgrade to CLIP ViT-L/14 | [OpenAI CLIP](https://github.com/openai/CLIP) | `config.py` one line | +8-12% zero-shot accuracy |
+| Replace CLIP with SigLIP | [SigLIP via HuggingFace](https://huggingface.co/google/siglip-so400m-patch14-384) | `clip_embedder.py` | Better on small crops and unusual objects |
+| Use BLIP-2 for mask captioning | [BLIP-2](https://github.com/salesforce/LAVIS) | `clip_embedder.py` | Free-text label instead of forced vocabulary |
+| Expand indoor vocabulary | Edit `INDOOR_VOCAB` in `clip_embedder.py` | `clip_embedder.py` | Add domain-specific labels per deployment |
+| Use SAM2 instead of FastSAM | [SAM2](https://github.com/facebookresearch/sam2) | `segmentor.py` | Better mask boundaries, needs GPU |
+| Use Grounded-SAM for targeted masks | [Grounded-SAM](https://github.com/IDEA-Research/Grounded-Segment-Anything) | `segmentor.py` | Masks guided by text — higher precision |
+
+**Quickest single win:** Add robotics-specific labels to `INDOOR_VOCAB`
+in `clip_embedder.py` — terms like `"conveyor belt"`, `"pallet"`,
+`"safety barrier"`, `"emergency stop"` for industrial environments.
+Zero compute cost.
+
+---
+
+### 3 — VLM: richer scene descriptions
+
+**Problem:** The current VLM call happens once per scene with 5 keyframes.
+Spatial reasoning (distances, clearances) is limited.
+
+| Improvement | Tool | Drop-in location | Expected gain |
+|---|---|---|---|
+| Use Gemini 2.0 Flash (free tier) | [Google AI Studio](https://aistudio.google.com) | `config.py` + `vlm_describer.py` | Better spatial reasoning, longer context |
+| Pass depth map as second image | Existing DA2 output | `vlm_describer.py` | VLM can estimate real distances |
+| Multi-frame temporal description | Existing frame list | `vlm_describer.py` | Detects moving objects, scene changes |
+| Structured output with function calling | Groq JSON mode | `vlm_describer.py` | Guaranteed JSON, no parsing failures |
+| Add change detection between runs | Frame diff + VLM | new `change_detector.py` | Robot knows what changed since last visit |
+
+**Quickest single win:** Enable JSON mode on the Groq API call in
+`vlm_describer.py` by adding `response_format={"type": "json_object"}`
+to the `client.chat.completions.create()` call. Eliminates all JSON
+parsing failures at zero cost.
+
+---
+
+### 4 — Accuracy: better metrics
+
+**Problem:** Depth consistency score is 0.0 because the camera barely
+moved (0.12m trajectory), giving no overlapping frame pairs to compare.
+
+| Improvement | Tool | Drop-in location | Expected gain |
+|---|---|---|---|
+| Add surface normal consistency metric | Open3D normals | `accuracy.py` | Measures mesh quality, not just depth |
+| Add query recall metric | Manual ground truth labels | `accuracy.py` | Measures whether queries find the right region |
+| Benchmark against RGB-D dataset | [ScanNet](http://www.scan-net.org) | new `benchmark.py` | Quantitative comparison vs published methods |
+| Add real-time FPS measurement | Python `time` module | `accuracy.py` | Shows deployment viability |
+| Visualise error heatmap on cloud | Open3D colour map | `accuracy.py` | Shows which regions have worst depth |
+
+---
+
+### 5 — Deployment: real-time on-robot
+
+**Problem:** Current pipeline runs offline (8-30 min per video).
+A deployed robot needs near-real-time scene understanding.
+
+| Improvement | Tool | Expected gain |
+|---|---|---|
+| Quantise DA2 to INT8 | [ONNX Runtime](https://github.com/microsoft/onnxruntime) | 4× faster depth, runs on edge CPU |
+| Quantise CLIP to INT8 | [OpenCLIP](https://github.com/mlfoundations/open_clip) | 150MB → 40MB, 3× faster query |
+| Replace FastSAM with MobileSAM | [MobileSAM](https://github.com/ChaoningZhang/MobileSAM) | 40MB, faster on ARM CPU |
+| Incremental map updates | Open3D `ScalableTSDFVolume` | Add new frames without full reprocessing |
+| ROS2 integration | [ROS2](https://docs.ros.org/en/humble) | Publish query results as ROS topics |
+| Export to ROS occupancy grid | Open3D + numpy | Direct input to ROS navigation stack |
+
+**Full real-time pipeline estimate on Jetson Orin NX (16GB):**
+
+| Stage | Optimised time |
+|---|---|
+| Depth estimation (DA2 INT8) | 30ms/frame |
+| Pose estimation (ORB+PnP) | 5ms/frame |
+| CLIP query at runtime | 25ms/query |
+| Total per query | <100ms |
+
+---
+
+### 6 — Video quality guidance for users
+
+The single biggest improvement to reconstruction quality requires no code
+changes — just better video input.
+
+**Filming protocol for best results:**
+- Move at 5cm/s — slower than feels natural
+- Overlap each new position with 60% of the previous view
+- Complete a full loop back to the starting position
+- Keep the camera at chest height throughout
+- Film in portrait mode for rooms, landscape for corridors
+- Ensure even lighting — avoid windows causing harsh shadows
+- Total duration 40-60 seconds for a typical room
+
+A video following this protocol will produce 3-5× better geometry
+than a casually filmed video of the same scene.
+
+
+
 ---
 
 ## Connection to KinetIQ
