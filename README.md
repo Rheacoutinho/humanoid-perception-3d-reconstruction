@@ -20,37 +20,40 @@ This system answers those questions directly, returning 3D coordinates a robot c
 ---
 
 ## Pipeline
+
+```
 Video → Frames → Depth-Anything V2 → ORB+PnP Poses → 3D Fusion
-↓
+                                                          ↓
 Natural language query ← CLIP similarity search ← CLIP embeddings per region
-↑
-FastSAM masks + Llama 4 Vision
+                                                          ↑
+                                          FastSAM masks + Llama 4 Vision (Groq API)
+```
 
 | Stage | Tool | Purpose |
 |---|---|---|
 | Frame extraction | OpenCV | Sharpness-filtered, temporally uniform |
-| Depth estimation | Depth-Anything V2 Small | Per-frame metric depth, CPU-friendly |
+| Depth estimation | Depth-Anything V2 Small | Per-frame metric depth, runs on CPU |
 | Pose estimation | ORB + depth-anchored PnP | Drift-free camera trajectory |
 | 3D fusion | Open3D | Back-projection + voxel fusion |
-| Scene description | Llama 4 Vision (Groq API) | Structured JSON: objects, navigable regions, obstacles |
-| Segmentation | FastSAM-s (23MB) | Per-frame instance masks |
+| Scene description | Llama 4 Scout Vision via Groq API (free tier) | Structured JSON: objects, navigable regions, obstacles |
+| Segmentation | FastSAM-s (23MB) | Per-frame instance masks, CPU-friendly |
 | Semantic embedding | CLIP ViT-B/32 | 512-dim embedding per mask region |
 | Language query | Cosine similarity | Text query → 3D bounding box + confidence |
 | Accuracy measurement | Custom metrics | Depth consistency, pose quality, query precision, coverage |
 
 ---
+
 ## Demo
 
 ![3D Scene](assets/demo_3d_scene.png)
 *5.1M point cloud with VLM scene description*
 
-
 ![Query Result](assets/demo_query_chair.png)
 *Natural language query "chair" — highlighted in 3D with bounding box*
 
-
 ![Accuracy](assets/accuracy_dashboard.png)
 
+---
 
 ## Key design decisions
 
@@ -58,16 +61,25 @@ FastSAM masks + Llama 4 Vision
 Storing a 512-dim embedding per point (5M × 512 × 4 bytes = 10GB) is not deployable. Instead we store one embedding per detected mask region (~300 masks × 512 × 4 bytes = 0.6MB) and assign each point a mask ID. Query-time RAM drops from >10GB to ~300MB total.
 
 **Depth-Anything V2 as primary geometry engine**
-MASt3R produces excellent geometry but requires 8GB+ VRAM and crashes on free Colab repeatedly. DA2-Small runs at 15 FPS on CPU, generalises to any background, and produces sufficient depth for navigation-quality reconstruction.
+MASt3R was the original choice — it produces excellent geometry but requires 8GB+ VRAM. After repeated out-of-memory crashes on the free Colab CPU runtime (13.6GB RAM, no GPU), we switched to DA2-Small which runs entirely on CPU, generalises to any background including textureless surfaces, and produces sufficient depth for navigation-quality reconstruction.
 
 **Depth-anchored PnP for pose estimation**
-Standard optical flow integrates relative poses, causing drift that compounds over the video. We instead use PnP — given 3D world points from the reference frame's depth map, we solve for each new frame's absolute pose directly. Result: 99% PnP success rate, no drift.
+Standard optical flow integrates relative poses, causing drift that compounds over the video — our initial tests produced a room with 19m X-range instead of 4m. Depth-anchored PnP solves each frame's pose directly against world coordinates from the reference depth map, eliminating drift. Result: 99% PnP success rate.
+
+**Llama 4 Vision via Groq API for scene description**
+Scene understanding is handled by a single API call to Llama 4 Scout Vision on Groq's free tier (no credit card, no local GPU). The model receives 5 keyframes and returns structured JSON with objects, navigable regions, obstacles, and robot navigation notes. Gemini 2.0 Flash is listed as a future alternative in the Future Scope section — it was not used in the current system.
+
+**Fully CPU-deployable**
+The entire pipeline was developed and tested on Google Colab's free CPU runtime (13.6GB RAM, no GPU). No GPU was used at any point during development. All models were selected specifically to fit within this constraint:
+- DA2-Small: 80MB, ~15 FPS on CPU
+- CLIP ViT-B/32: 150MB, ~80ms per image on CPU
+- FastSAM-s: 23MB, ~25ms per frame on CPU
 
 **Free and open source throughout**
 - Depth-Anything V2: Apache 2.0
 - CLIP: MIT
 - FastSAM: Apache 2.0
-- Llama 4 Scout Vision via Groq: free tier, no credit card
+- Llama 4 Scout Vision via Groq: free tier, no credit card required
 
 ---
 
@@ -84,17 +96,30 @@ The system measures four quantitative metrics automatically:
 
 Results saved to `output/accuracy_report.json` and rendered as a visual dashboard.
 
+**Scores achieved on test video:**
+
+| Metric | Score | Notes |
+|---|---|---|
+| Pose quality | 99.2/100 | 99% PnP success, smooth trajectory |
+| Query quality | 75.2/100 | Mean confidence 55%, compactness >0.7 |
+| Depth consistency | 0.0/100 | Camera moved only 0.12m — insufficient overlap for measurement |
+| Embedding coverage | 53.2/100 | 2.3% direct assignment, 44% after background sampling |
+| **Overall** | **58.6/100** | |
+
+The depth consistency score of 0.0 is a video limitation, not a code limitation — it requires frame pairs that see the same surface from different angles. A video with more camera movement will produce non-zero scores. See Future Scope §4 for the fix.
+
 ---
 
 ## Compute requirements
 
-| Mode | RAM | VRAM | Speed |
+| Mode | RAM | GPU | Speed |
 |---|---|---|---|
-| CPU only (minimum) | 4GB | 0 | ~8 min/video |
-| GPU (T4 recommended) | 4GB | 4GB | ~3 min/video |
-| Query at runtime | <300MB | 0 | <100ms/query |
+| CPU only — tested configuration | 13.6GB | None | ~20 min/video |
+| CPU only — minimum viable | 4GB | None | ~30 min/video |
+| GPU accelerated (optional) | 4GB | T4 4GB | ~5 min/video |
+| Query at runtime | <300MB | None | <100ms/query |
 
-The entire inference pipeline (excluding model downloads) runs on **CPU only with 4GB RAM**. No GPU required for deployment.
+**This system was developed and tested entirely on CPU with no GPU.** GPU acceleration is optional and improves speed but is not required for correctness.
 
 ---
 
@@ -107,11 +132,13 @@ pip install -r requirements.txt
 pip install git+https://github.com/openai/CLIP.git
 
 # Download FastSAM checkpoint (~23MB)
+mkdir -p checkpoints
 wget -O checkpoints/FastSAM-s.pt \
   https://huggingface.co/CASIA-IVA-Lab/FastSAM-s/resolve/main/weights/FastSAM-s.pt
 ```
 
-Set your free Groq API key (sign up at console.groq.com — no credit card):
+Set your free Groq API key — sign up at [console.groq.com](https://console.groq.com), no credit card required:
+
 ```bash
 export GROQ_API_KEY="gsk_your_key_here"
 ```
@@ -121,44 +148,46 @@ export GROQ_API_KEY="gsk_your_key_here"
 ## Usage
 
 ### Streamlit web app (recommended)
+
 ```bash
 streamlit run src/app_streamlit.py -- --output_dir output/
 ```
+
 ### Gradio web app (alternative)
+
 ```bash
 python src/app.py --fastsam checkpoints/FastSAM-s.pt --output output/
 ```
 
-Open the printed URL. Upload a video, process it, then query the scene.
-
 ### Python API
+
 ```python
 from src.pipeline import Pipeline
 
 pipeline = Pipeline(
     output_dir   = "output/my_scene",
     fastsam_ckpt = "checkpoints/FastSAM-s.pt",
-    groq_api_key = "gsk_...",
+    groq_api_key = "gsk_...",   # free at console.groq.com
 )
 
-# Process a video
+# Process a video (runs entirely on CPU)
 result = pipeline.run("room.mp4")
 
-# Query the scene
+# Query the scene in natural language
 answer = pipeline.query("where is the navigable floor?")
-print(answer["bbox_centre"])    # [x, y, z] in metres
-print(answer["confidence"])     # 0-100
-print(answer["vlm_context"])    # VLM-identified matching objects
+print(answer["bbox_centre"])   # [x, y, z] in metres
+print(answer["confidence"])    # 0-100
+print(answer["vlm_context"])   # VLM-identified matching objects
 ```
 
 ### Robot integration example
+
 ```python
-# The query result is directly usable for robot navigation
 result = pipeline.query("clear path to move forward")
 
-target   = result["bbox_centre"]   # [x, y, z] metres — navigate here
-size     = result["bbox_size"]     # safe region dimensions
-conf     = result["confidence"]    # how certain the system is
+target = result["bbox_centre"]   # [x, y, z] metres — navigate here
+size   = result["bbox_size"]     # safe region dimensions in metres
+conf   = result["confidence"]    # how certain the system is (0-100)
 
 if conf > 40:
     robot.navigate_to(target)
@@ -182,48 +211,53 @@ else:
 ---
 
 ## Repository structure
-humanoid-perception-3d-reconstruction/
-├── config.py                  # All settings in one place
-├── requirements.txt
-├── src/
-│   ├── depth_estimator.py     # Depth-Anything V2 wrapper
-│   ├── pose_estimator.py      # ORB + depth-anchored PnP
-│   ├── cloud_builder.py       # 3D fusion + CLIP embedding
-│   ├── segmentor.py           # FastSAM instance segmentation
-│   ├── clip_embedder.py       # CLIP ViT-B/32 text+image embedding
-│   ├── vlm_describer.py       # Llama 4 Vision scene description
-│   ├── query_engine.py        # Language → 3D cosine search
-│   ├── accuracy.py            # Four quantitative accuracy metrics
-│   ├── pipeline.py            # End-to-end orchestrator
-│   ├── app_streamlit.py       # Streamlit web interface (recommended)
-│   └── app.py                 # Gradio web interface (alternate)
-└── output/                    # Generated outputs (gitignored)
-├── pointcloud_rgb.ply
-├── pointcloud_query.npz
-├── scene_description.json
-├── accuracy_report.json
-└── accuracy_dashboard.png
 
+```
+humanoid-perception-3d-reconstruction/
+├── config.py                   # All settings in one place
+├── requirements.txt
+├── reconstruction_pipeline.ipynb  # Colab notebook — full pipeline walkthrough
+├── src/
+│   ├── depth_estimator.py      # Depth-Anything V2 Small wrapper
+│   ├── pose_estimator.py       # ORB keypoints + depth-anchored PnP
+│   ├── cloud_builder.py        # 3D point cloud fusion + CLIP embedding
+│   ├── segmentor.py            # FastSAM-s instance segmentation
+│   ├── clip_embedder.py        # CLIP ViT-B/32 text + image embedding
+│   ├── vlm_describer.py        # Llama 4 Vision scene description (Groq API)
+│   ├── query_engine.py         # Language → 3D cosine similarity search
+│   ├── accuracy.py             # Four quantitative accuracy metrics
+│   ├── pipeline.py             # End-to-end orchestrator
+│   ├── app_streamlit.py        # Streamlit web interface (recommended)
+│   └── app.py                  # Gradio web interface (alternative)
+├── assets/
+│   ├── demo_3d_scene.png
+│   ├── demo_query_chair.png
+│   └── accuracy_dashboard.png
+└── output/                     # Generated outputs (gitignored)
+    ├── pointcloud_rgb.ply
+    ├── pointcloud_query.npz
+    ├── scene_description.json
+    ├── accuracy_report.json
+    └── accuracy_dashboard.png
+```
 
 ---
 
 ## Design tradeoffs
 
 **What this system does well:**
-- Works on any indoor video, any background, any lighting
-- CPU-deployable with low RAM footprint
-- Queries return actionable 3D coordinates, not just labels
-- VLM scene description adapts to each scene without retraining
-- Crash-resilient: saves progress to Drive after every processing stage
+- Runs entirely on CPU with no GPU — deployable on any hardware
+- Works on any indoor video, any background, any lighting conditions
+- Queries return actionable 3D coordinates and bounding boxes, not just labels
+- VLM scene description adapts to each new scene without retraining
+- Crash-resilient: saves progress to Google Drive after every processing stage
 
-**Current limitations and known improvements:**
-- Camera with minimal motion produces sparse point clouds — a longer, more overlapping video significantly improves geometry
-- CLIP accuracy on unusual objects is limited by ViT-B/32 capacity — ViT-L/14 would improve label quality at 3× the RAM cost
-- Depth scale is estimated heuristically — a known camera intrinsic file would give metric accuracy
-- Embedding coverage (~45% of points) could be improved by propagating mask IDs via KD-tree on a machine with >15GB RAM
-
-
-
+**Current limitations:**
+- Camera with minimal motion (<0.5m trajectory) produces sparse point clouds and zero depth consistency score — a longer, more overlapping video significantly improves geometry
+- CLIP ViT-B/32 confidence scores are low (0.24–0.27) on unusual objects — the model is general-purpose and masked crops are small
+- Depth scale is estimated heuristically from a 0.5m near-anchor assumption — a known camera intrinsic file would give metric accuracy
+- Embedding coverage was 2.3% direct assignment due to tight 15cm KD-tree radius and minimal camera movement — wider radius and more camera motion improve this substantially
+- Processing time is 20–30 minutes on CPU for a 20-second video — acceptable for offline mapping, not for real-time use
 
 ---
 
@@ -242,13 +276,13 @@ and low point density in textureless areas (plain walls, floors).
 | Replace ORB with SuperPoint keypoints | [SuperPoint](https://github.com/magicleap/SuperPointPretrainer) | `pose_estimator.py` | 2-3× more matches, less drift |
 | Replace PnP with LoFTR dense matching | [LoFTR](https://github.com/zju3dv/LoFTR) | `pose_estimator.py` | Works on textureless surfaces |
 | Add loop closure detection | [NetVLAD](https://github.com/Relja/netvlad) | new `loop_closure.py` | Eliminates cumulative drift |
-| Replace DA2-Small with DA2-Large | [Depth-Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) | `config.py` one line | Sharper depth on edges |
+| Replace DA2-Small with DA2-Large | [Depth-Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) | `config.py` one line | Sharper depth on edges, needs GPU |
 | Add TSDF fusion instead of voxel grid | Open3D `ScalableTSDFVolume` | `cloud_builder.py` | Watertight surfaces, no duplicate points |
-| Use metric depth with known intrinsics | Phone camera intrinsics file | `pose_estimator.py` | Eliminates scale estimation error |
+| Use metric depth with known intrinsics | Phone camera intrinsics file | `pose_estimator.py` | Eliminates scale estimation error entirely |
 
 **Quickest single win:** Change `DEPTH_MODEL` in `config.py` from
 `Depth-Anything-V2-Small-hf` to `Depth-Anything-V2-Large-hf`.
-Requires GPU but no code changes.
+Requires a GPU but is a single config line change.
 
 ---
 
@@ -269,21 +303,21 @@ the model is general-purpose and the masked crops are small.
 **Quickest single win:** Add robotics-specific labels to `INDOOR_VOCAB`
 in `clip_embedder.py` — terms like `"conveyor belt"`, `"pallet"`,
 `"safety barrier"`, `"emergency stop"` for industrial environments.
-Zero compute cost.
+Zero compute cost, zero code changes outside that one list.
 
 ---
 
 ### 3 — VLM: richer scene descriptions
 
 **Problem:** The current VLM call happens once per scene with 5 keyframes.
-Spatial reasoning (distances, clearances) is limited.
+Spatial reasoning about distances and clearances is limited.
 
 | Improvement | Tool | Drop-in location | Expected gain |
 |---|---|---|---|
-| Use Gemini 2.0 Flash (free tier) | [Google AI Studio](https://aistudio.google.com) | `config.py` + `vlm_describer.py` | Better spatial reasoning, longer context |
-| Pass depth map as second image | Existing DA2 output | `vlm_describer.py` | VLM can estimate real distances |
-| Multi-frame temporal description | Existing frame list | `vlm_describer.py` | Detects moving objects, scene changes |
-| Structured output with function calling | Groq JSON mode | `vlm_describer.py` | Guaranteed JSON, no parsing failures |
+| Switch to Gemini 2.0 Flash (free tier) | [Google AI Studio](https://aistudio.google.com) | `config.py` + `vlm_describer.py` | Better spatial reasoning, 1M token context |
+| Pass depth map as second image | Existing DA2 output | `vlm_describer.py` | VLM can estimate real-world distances |
+| Multi-frame temporal description | Existing frame list | `vlm_describer.py` | Detects moving objects and scene changes |
+| Enable JSON mode on Groq API | Groq API parameter | `vlm_describer.py` | Guaranteed valid JSON, no parsing failures |
 | Add change detection between runs | Frame diff + VLM | new `change_detector.py` | Robot knows what changed since last visit |
 
 **Quickest single win:** Enable JSON mode on the Groq API call in
@@ -300,17 +334,17 @@ moved (0.12m trajectory), giving no overlapping frame pairs to compare.
 
 | Improvement | Tool | Drop-in location | Expected gain |
 |---|---|---|---|
-| Add surface normal consistency metric | Open3D normals | `accuracy.py` | Measures mesh quality, not just depth |
-| Add query recall metric | Manual ground truth labels | `accuracy.py` | Measures whether queries find the right region |
+| Add surface normal consistency metric | Open3D normals | `accuracy.py` | Measures mesh quality independent of camera motion |
+| Add query recall metric | Manual ground truth labels | `accuracy.py` | Measures whether queries find the correct region |
 | Benchmark against RGB-D dataset | [ScanNet](http://www.scan-net.org) | new `benchmark.py` | Quantitative comparison vs published methods |
-| Add real-time FPS measurement | Python `time` module | `accuracy.py` | Shows deployment viability |
-| Visualise error heatmap on cloud | Open3D colour map | `accuracy.py` | Shows which regions have worst depth |
+| Add real-time FPS measurement | Python `time` module | `accuracy.py` | Shows deployment viability on target hardware |
+| Visualise error heatmap on cloud | Open3D colour map | `accuracy.py` | Shows which regions have worst depth quality |
 
 ---
 
 ### 5 — Deployment: real-time on-robot
 
-**Problem:** Current pipeline runs offline (8-30 min per video).
+**Problem:** Current pipeline runs offline (~20 min per video on CPU).
 A deployed robot needs near-real-time scene understanding.
 
 | Improvement | Tool | Expected gain |
@@ -322,35 +356,33 @@ A deployed robot needs near-real-time scene understanding.
 | ROS2 integration | [ROS2](https://docs.ros.org/en/humble) | Publish query results as ROS topics |
 | Export to ROS occupancy grid | Open3D + numpy | Direct input to ROS navigation stack |
 
-**Full real-time pipeline estimate on Jetson Orin NX (16GB):**
+**Estimated real-time pipeline on Jetson Orin NX (16GB, no cloud):**
 
 | Stage | Optimised time |
 |---|---|
 | Depth estimation (DA2 INT8) | 30ms/frame |
 | Pose estimation (ORB+PnP) | 5ms/frame |
 | CLIP query at runtime | 25ms/query |
-| Total per query | <100ms |
+| **Total per query** | **<100ms** |
 
 ---
 
-### 6 — Video quality guidance for users
+### 6 — Video quality guidance
 
 The single biggest improvement to reconstruction quality requires no code
-changes — just better video input.
+changes — just better input video.
 
 **Filming protocol for best results:**
 - Move at 5cm/s — slower than feels natural
 - Overlap each new position with 60% of the previous view
 - Complete a full loop back to the starting position
 - Keep the camera at chest height throughout
-- Film in portrait mode for rooms, landscape for corridors
+- Film in landscape mode for rooms, portrait for corridors
 - Ensure even lighting — avoid windows causing harsh shadows
-- Total duration 40-60 seconds for a typical room
+- Total duration 40–60 seconds for a typical room
 
-A video following this protocol will produce 3-5× better geometry
+A video following this protocol produces 3–5× better geometry
 than a casually filmed video of the same scene.
-
-
 
 ---
 
@@ -367,5 +399,3 @@ Humanoid's KinetIQ framework uses VLMs and VLAs for robot perception and navigat
 
 *Built by Rhea Coutinho for the Humanoid Robotics internship challenge.*
 *All models are open source. No proprietary APIs required.*
-
-
